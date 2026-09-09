@@ -1,0 +1,347 @@
+# -*- coding: utf-8 -*-
+"""
+test_psf_zero_aerospace_core_v2.py
+
+A rewrite of test_psf_zero_aerospace_core.py. What was wrong with it:
+
+ A. IT NEVER FAILED.  There is not one assertion in the whole file. Every
+    section computes a boolean, prints it, and moves on; the process exits 0
+    whether the code works or not. `monotone_ok` in particular is computed
+    and printed and then discarded. A test that cannot fail is a demo.
+
+ B. SECTION [1] CANNOT DISTINGUISH SUCCESS FROM FAILURE.  Each failure mode
+    is wrapped in `try/except` that prints only in the `except` branch. If a
+    future cvxpy or numpy stops raising, the block silently succeeds and
+    prints nothing — which looks exactly like the test not reaching that
+    line. The reproduction has to assert that the exception happens.
+    (Verified here: all three do currently reproduce — `tmax * active` really
+    does collapse to shape () , OSQP really does raise SolverError, and
+    np.clip really does raise ValueError on (3,) against (8,). The cvxpy
+    case also emits a UserWarning about `*` meaning matmul, which the pasted
+    test discards.)
+
+ C. SECTIONS [3] AND [4] DO NOT TEST THE MODULE.  Section [3] builds and
+    solves its own inline cvxpy problem and then calls `_apply_soft_mib` on
+    the result, so it never exercises `allocate_thrusters`' own QP — if the
+    module's QP differs, the test still passes. Section [4] calls
+    `np.linalg.lstsq` and `np.clip` inline and checks the shape: that tests
+    numpy, not the module's fallback, which is never invoked.
+
+ D. THE "NO UNWINDING" CHECK BOUNDS THE STEP AND NEVER THE TOTAL.
+    `np.all(np.diff(ang_err[50:]) <= 1.0)` allows 1 degree of re-growth per
+    step, i.e. 100 deg/s at dt=0.01. Measured: an error growing steadily at
+    0.9 deg/step, ending 2654 degrees away from where it started, passes as
+    "no unwinding: True". Worse, `ang_err` uses `abs(qe[0])`, so it is
+    already folded into [0, 180] and cannot represent going the long way
+    round at all — the quantity being checked cannot exhibit the phenomenon
+    the check is named after.
+
+    Replaced with two things that can fail. First, the error must never
+    exceed its own starting value. Second, a dedicated probe: start with a
+    quaternion in the FAR hemisphere whose true error is only 20 deg, and
+    integrate the path actually travelled, the integral of |omega| dt. A
+    short-path controller covers ~20 deg; one without the sign fix goes the
+    other way round. To prove the probe can detect it rather than asserting
+    that it can, the file includes a deliberately broken controller with the
+    qe[0] < 0 flip removed, and measures both:
+
+        with sign fix ...... final error 0.0000 deg, path travelled  27.7 deg
+        WITHOUT sign fix ... final error 0.0003 deg, path travelled 385.7 deg
+
+    Note that both converge, and both end with a tiny error — which is
+    exactly why an error-magnitude criterion cannot see the difference and a
+    path-length one can.
+
+ E. cvxpy SOLVE STATUS IS NEVER CHECKED before `.value` is used, so a failed
+    solve surfaces as a confusing TypeError on the next line.
+
+ F. THE TWO HALVES ARE NEVER CONNECTED.  The controller produces a torque,
+    the allocator turns a torque into thruster commands, and the file tests
+    them separately — so nothing checks that the torque the controller asks
+    for is one the thrusters can actually deliver. Section 6 closes that
+    loop and it is where the interesting failure lives.
+
+NOTE ON psf_zero_aerospace_core: the real module was not supplied, so this
+runs against the reference stand-in written alongside it. Drop your own
+module in its place and re-run — the harness only uses the four signatures
+the original test used.
+"""
+from __future__ import annotations
+
+import warnings
+
+import numpy as np
+
+try:
+    import cvxpy as cp
+except ImportError:
+    cp = None
+
+from psf_zero_aerospace_core import (
+    PSFZeroAttitudeController, allocate_thrusters, _apply_soft_mib, zero_clamp
+)
+
+FAILED = 0
+
+
+def check(ok: bool, what: str) -> bool:
+    global FAILED
+    print(f"  [{'PASS' if ok else 'FAIL'}] {what}")
+    if not ok:
+        FAILED += 1
+    return bool(ok)
+
+
+def sec(t: str) -> None:
+    print("\n" + "=" * 78 + f"\n{t}\n" + "=" * 78)
+
+
+def raises(fn, exc=Exception):
+    try:
+        fn()
+    except exc as e:
+        return type(e).__name__, str(e)
+    return None, None
+
+
+# ---------------------------------------------------------------------- 1
+sec("1. The original allocate_thrusters' failure modes, asserted (not just printed)")
+if cp is None:
+    check(False, "cvxpy not installed; cannot verify the solver failure modes")
+else:
+    tmax8 = np.ones(8) * 0.5
+    active = cp.Variable(8, boolean=True)
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        bad_shape = (tmax8 * active).shape
+        got_warning = any("matrix multiplication" in str(x.message) for x in w)
+    good_shape = cp.multiply(tmax8, active).shape
+    print(f"  tmax * active        -> shape {bad_shape}")
+    print(f"  cp.multiply(tmax, .) -> shape {good_shape}")
+    check(bad_shape == (), "`tmax * active` collapses to a scalar dot product")
+    check(good_shape == (8,), "cp.multiply is the elementwise form that was meant")
+    check(got_warning, "cvxpy warns that `*` means matmul (the original discards it)")
+
+    def _solve_pasted():
+        x = cp.Variable(8, nonneg=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            cp.Problem(cp.Minimize(cp.sum_squares(x)),
+                       [x <= tmax8 * active, x >= 0.005 * active]).solve(solver=cp.OSQP)
+
+    name, msg = raises(_solve_pasted)
+    print(f"  pasted MIQP under OSQP -> {name}: {str(msg)[:60]}")
+    check(name == "SolverError", "OSQP genuinely refuses the mixed-integer problem")
+
+name, msg = raises(lambda: np.clip(np.array([1.0, 2.0, 3.0]), 0.0, np.ones(8) * 0.5),
+                   ValueError)
+print(f"  np.clip((3,), 0, (8,)) -> {name}")
+check(name == "ValueError", "the original fallback's shape mismatch really does raise")
+
+# ---------------------------------------------------------------------- 2
+sec("2. allocate_thrusters: tracking, bounds, dead zone -- and a stub check")
+rng = np.random.default_rng(0)
+B = rng.standard_normal((3, 8)) * 0.1
+tmax = np.ones(8) * 0.5
+mib = np.ones(8) * 0.005
+
+# The ORIGINAL test's fixture. Its requested torque turns out to be
+# unreachable: with x >= 0, x=0 is optimal exactly when B^T tau <= 0
+# componentwise, and for this B and tau every component is negative
+# (a 1/256 draw). So allocate_thrusters correctly returns all zeros --
+# and the original test's only assertions ("within bounds", "no dead-zone
+# command") are both satisfied by all zeros, so that test would pass a
+# function that did nothing at all.
+tau_unreachable = np.array([0.01, 0.02, -0.015])
+g = B.T @ tau_unreachable
+x_un = allocate_thrusters(tau_unreachable, B, tmax, mib)
+print(f"  original fixture: B^T tau all <= 0 -> {bool(np.all(g <= 0))}, "
+      f"so x=0 is optimal")
+print(f"    allocate_thrusters -> {np.array2string(x_un, precision=3)}")
+check(np.all(np.abs(x_un) < 1e-6), "unreachable torque degrades to zero thrust, not garbage")
+check(np.all(x_un >= -1e-9) and np.all(x_un <= tmax + 1e-6),
+      "the original's own bound check -- which all-zeros also passes")
+
+# A REACHABLE torque, built from a known nonneg thrust vector, so tracking
+# can actually be asserted.
+x_true = np.array([0.30, 0.0, 0.15, 0.0, 0.22, 0.0, 0.08, 0.0])
+tau_reach = B @ x_true
+x_sol = allocate_thrusters(tau_reach, B, tmax, mib)
+resid = np.linalg.norm(B @ x_sol - tau_reach)
+print(f"  reachable torque {np.array2string(tau_reach, precision=4)}")
+print(f"    x = {np.array2string(x_sol, precision=4)}")
+print(f"    residual |Bx - tau| = {resid:.3e}  (|tau| = {np.linalg.norm(tau_reach):.4f})")
+check(x_sol.shape == (8,), "output has one entry per thruster")
+check(np.all(x_sol >= -1e-9) and np.all(x_sol <= tmax + 1e-6), "within [0, tmax]")
+check(not np.any((x_sol > 1e-9) & (x_sol < mib - 1e-9)), "no command inside (0, mib)")
+check(resid < 0.05 * np.linalg.norm(tau_reach),
+      "tracks a reachable torque to better than 5% (a do-nothing stub fails this)")
+
+# The meta-check: would a stub that returns zeros pass this section?
+stub = np.zeros(8)
+stub_ok = (np.all(stub >= 0) and np.all(stub <= tmax)
+           and not np.any((stub > 1e-9) & (stub < mib - 1e-9)))
+stub_tracks = np.linalg.norm(B @ stub - tau_reach) < 0.05 * np.linalg.norm(tau_reach)
+print(f"  a `return np.zeros(8)` stub: passes bounds+deadzone={stub_ok}, "
+      f"passes tracking={stub_tracks}")
+check(stub_ok and not stub_tracks,
+      "the tracking assertion is what makes this section able to fail")
+
+# ---------------------------------------------------------------------- 3
+sec("3. Soft-MIB engages -- driven through the MODULE, not an inline QP")
+B2 = np.array([[1.0, 0.02], [0.0, 0.0], [0.0, 0.0]])
+tmax2 = np.array([1.0, 1.0])
+mib2 = np.array([0.01, 0.05])
+tau_des2 = np.array([0.3, 0.0, 0.0])
+
+x_mod = allocate_thrusters(tau_des2, B2, tmax2, mib2)
+print(f"  allocate_thrusters -> {np.array2string(x_mod, precision=6)}")
+check(not np.any((x_mod > 1e-9) & (x_mod < mib2 - 1e-9)),
+      "module output has no dead-zone command (this is the real end-to-end path)")
+
+# and separately, that _apply_soft_mib does the snapping it claims
+x_raw = np.array([0.3, 0.02])          # thruster 2 strictly inside (0, 0.05)
+print(f"  hand-built raw command {x_raw} has thruster 1 inside its dead zone")
+x_fixed = _apply_soft_mib(x_raw, B2, tau_des2, tmax2, mib2, np.eye(3), 1e-4)
+print(f"  _apply_soft_mib     -> {np.array2string(x_fixed, precision=6)}")
+check(not np.any((x_fixed > 1e-9) & (x_fixed < mib2 - 1e-9)), "dead zone cleared")
+check(x_fixed[1] in (0.0, mib2[1]) or np.isclose(x_fixed[1], 0.0)
+      or np.isclose(x_fixed[1], mib2[1]),
+      "the offending thruster was snapped to an endpoint, not left mid-zone")
+
+# ---------------------------------------------------------------------- 4
+sec("4. The fallback path is exercised through the module")
+# Force the QP to be unavailable so the fallback actually runs.
+import psf_zero_aerospace_core as core
+saved, core.cp = core.cp, None
+try:
+    x_fb = allocate_thrusters(tau_reach, B, tmax, mib)
+finally:
+    core.cp = saved
+print(f"  fallback output shape {x_fb.shape}, range "
+      f"[{x_fb.min():.4f}, {x_fb.max():.4f}]")
+check(x_fb.shape == (8,), "fallback returns one entry per thruster, not per axis")
+check(np.all(x_fb >= -1e-9) and np.all(x_fb <= tmax + 1e-6), "fallback respects bounds")
+check(not np.any((x_fb > 1e-9) & (x_fb < mib - 1e-9)),
+      "fallback output is also dead-zone clean")
+
+# ---------------------------------------------------------------------- 5
+sec("5. Closed-loop attitude convergence, with a check that can actually fail")
+
+
+def q_mul(a, b):
+    w1, x1, y1, z1 = a
+    w2, x2, y2, z2 = b
+    return np.array([w1*w2 - x1*x2 - y1*y2 - z1*z2,
+                     w1*x2 + x1*w2 + y1*z2 - z1*y2,
+                     w1*y2 - x1*z2 + y1*w2 + z1*x2,
+                     w1*z2 + x1*y2 - y1*x2 + z1*w2])
+
+
+def simulate(q0, q_des, J, ctrl, dt=0.01, steps=3000, allocator=None):
+    q, omega = q0.copy(), np.zeros(3)
+    err = np.empty(steps)
+    path = 0.0                      # integral of |omega| dt: distance travelled
+    for k in range(steps):
+        tau = ctrl.compute_torque(q, q_des, omega, Kq=5.0, Kw=10.0)
+        if allocator is not None:
+            tau = allocator(tau)
+        omega = omega + np.linalg.solve(J, tau - np.cross(omega, J @ omega)) * dt
+        q = q + 0.5 * q_mul(q, np.array([0.0, *omega])) * dt
+        q = q / np.linalg.norm(q)
+        qe = q_mul(np.array([q_des[0], -q_des[1], -q_des[2], -q_des[3]]), q)
+        err[k] = 2 * np.degrees(np.arccos(np.clip(abs(qe[0]), -1, 1)))
+        path += np.linalg.norm(omega) * dt
+    return err, np.linalg.norm(omega), np.degrees(path)
+
+
+J = np.diag([50.0, 60.0, 40.0])
+q_des = np.array([1.0, 0.0, 0.0, 0.0])
+axis = np.array([0.0, 0.0, 1.0])
+
+
+class NoShortestPath(PSFZeroAttitudeController):
+    """Same controller with the qe[0] < 0 sign flip removed -- the classic
+    unwinding bug. Present so the unwinding test can be shown to detect the
+    thing it is named after, instead of being asserted to."""
+
+    def compute_torque(self, q, q_des, omega, Kq=5.0, Kw=10.0):
+        from psf_zero_aerospace_core import _q_conj, _q_mul
+        qe = _q_mul(_q_conj(np.asarray(q_des, float)), np.asarray(q, float))
+        return -Kq * zero_clamp(qe[1:4], self.tau) - Kw * np.asarray(omega, float)
+
+
+print(f"  {'case':<30}{'final err':>11}{'|omega|':>10}{'path':>9}{'shortest':>10}{'ratio':>8}")
+for label, deg, steps in (("45 deg", 45, 8000), ("179 deg near-antipodal", 179, 8000)):
+    a = np.radians(deg)
+    q0 = np.array([np.cos(a / 2), *(np.sin(a / 2) * axis)])
+    err, w_end, path = simulate(q0, q_des, J, PSFZeroAttitudeController(tau=0.8),
+                                steps=steps)
+    print(f"  {label:<30}{err[-1]:>10.4f}{w_end:>10.5f}{path:>9.1f}{deg:>10}{path/deg:>8.3f}")
+    check(err[-1] < 1.0, f"{label}: converges to under 1 deg")
+    check(w_end < 1e-3, f"{label}: rate is driven to zero")
+    check(err.max() <= err[0] + 1.0,
+          f"{label}: error never exceeds its starting value (no detour)")
+    tail = err[len(err) // 2:]
+    check(tail.max() - err[-1] < 5.0, f"{label}: no late re-growth in the tail")
+
+# The decisive unwinding case: a small PHYSICAL error whose quaternion sits
+# in the far hemisphere. Shortest path is 20 deg; a controller without the
+# sign fix rotates 340 deg the other way.
+print("\n  unwinding probe -- q0 in the far hemisphere, true error only 20 deg:")
+a = np.radians(10.0)
+q_far = -np.array([np.cos(a), *(np.sin(a) * axis)])
+for name, ctrl in (("with sign fix", PSFZeroAttitudeController(tau=0.8)),
+                   ("WITHOUT sign fix", NoShortestPath(tau=0.8))):
+    err, w_end, path = simulate(q_far, q_des, J, ctrl, steps=12000)
+    print(f"    {name:<18} final err {err[-1]:7.4f} deg, path travelled "
+          f"{path:7.1f} deg  (shortest = 20)")
+    if name == "with sign fix":
+        check(path < 60.0, "short-path controller stays near the 20 deg geodesic")
+    else:
+        check(path > 200.0,
+              "the probe DOES detect unwinding when the sign fix is removed")
+
+print("\n  For contrast, the original's own criterion on a fabricated bad trace:")
+bad = np.concatenate([np.full(50, 45.0), 45.0 + 0.9 * np.arange(2950)])
+print(f"    error drifts to {bad[-1]:.0f} deg; original check says "
+      f"'no unwinding: {bool(np.all(np.diff(bad[50:]) <= 1.0))}'")
+check(np.all(np.diff(bad[50:]) <= 1.0),
+      "confirmed: the original criterion passes a 2700 deg divergence")
+
+# ---------------------------------------------------------------------- 6
+sec("6. Controller and allocator in the same loop (never tested before)")
+# 8 thrusters on a cube, each producing a bounded positive-only torque.
+Bt = np.array([
+    [1.0, -1.0, 0.0, 0.0, 0.5, -0.5, 0.2, -0.2],
+    [0.0, 0.0, 1.0, -1.0, 0.5, -0.5, -0.2, 0.2],
+    [0.2, -0.2, -0.2, 0.2, 1.0, -1.0, 1.0, -1.0],
+]) * 2.0
+tmax_t = np.ones(8) * 1.0
+mib_t = np.ones(8) * 0.02
+
+
+def allocate(tau_cmd):
+    x = allocate_thrusters(tau_cmd, Bt, tmax_t, mib_t)
+    return Bt @ x
+
+
+a = np.radians(45)
+q0 = np.array([np.cos(a / 2), *(np.sin(a / 2) * axis)])
+q45 = np.array([np.cos(np.radians(45)/2), *(np.sin(np.radians(45)/2)*axis)])
+err_i, w_i, path_i = simulate(q45, q_des, J, PSFZeroAttitudeController(0.8), steps=8000)
+err_a, w_a, path_a = simulate(q45, q_des, J, PSFZeroAttitudeController(0.8),
+                              steps=8000, allocator=allocate)
+print(f"  ideal torque   : final err {err_i[-1]:7.4f} deg, |omega| {w_i:.2e}")
+print(f"  through thrusters: final err {err_a[-1]:7.4f} deg, |omega| {w_a:.2e}")
+worst = max(np.linalg.norm(allocate(t) - t) for t in
+            (np.array([0.1, 0.0, 0.0]), np.array([0.0, 0.05, -0.03]),
+             np.array([2.0, 2.0, 2.0])))
+print(f"  worst |delivered - requested| over 3 probe torques: {worst:.4f} N m")
+check(err_a[-1] < 2.0, "still converges when every torque goes through the thrusters")
+check(abs(err_a[-1] - err_i[-1]) < 2.0,
+      "quantisation by the MIB does not destroy the pointing accuracy")
+
+print(f"\n{'ALL CHECKS PASSED' if not FAILED else 'SOME CHECKS FAILED'}  "
+      f"({FAILED} failure{'' if FAILED == 1 else 's'})")
+raise SystemExit(0 if FAILED == 0 else 1)
